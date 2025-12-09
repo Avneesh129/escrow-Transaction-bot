@@ -1,25 +1,19 @@
 import logging
+import os
 import uuid
 from datetime import datetime
 
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-import os
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-ADMIN_IDS = {5550057048, 5986685988, 6115650303, 7088910329, 1742254233}
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lower()  # e.g. "@dvatransactionbot"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,188 +21,164 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ESCROWS = {}
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+# deals: deal_id -> dict
+DEALS = {}
+# map message_id in group -> deal_id (so /Close as a reply works)
+MSG_TO_DEAL = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Manual Escrow Bot me welcome!\n\n"
-        "/new_escrow @buyer @seller amount terms...\n"
-        "/my_escrows  – tumhare saare deals\n\n"
-        "Buyer payment proof bhejne ke liye message likhe:\n"
-        "proof <escrow_id> <txid ya note>"
-    )
-    await update.message.reply_text(text)
-
-
-async def new_escrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 3:
+    chat = update.effective_chat
+    if chat.type in ("group", "supergroup"):
         await update.message.reply_text(
-            "Usage: /new_escrow @buyer @seller amount terms..."
+            "👋🏻 Hi!\n"
+            "I am a simple escrow helper bot.\n\n"
+            "Use:\n"
+            "/Add <amount> [short note]\n"
+            "Then, when deal is completed, reply with /Close to close it."
         )
+    else:
+        await update.message.reply_text(
+            "👋🏻 Hi!\n"
+            "Add me to a supergroup and promote as admin.\n"
+            "Then use /Add <amount> in that group."
+        )
+
+
+def parse_amount_and_note(args):
+    if not args:
+        return None, ""
+    amount = args[0]
+    note = " ".join(args[1:]) if len(args) > 1 else ""
+    return amount, note
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    chat = msg.chat
+
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("Ye command sirf group / supergroup me use karo.")
         return
 
-    buyer_username = args[0]
-    seller_username = args[1]
-    amount = args[2]
-    terms = " ".join(args[3:]) if len(args) > 3 else ""
+    # if command is like /Add@BotName, strip the bot mention
+    if context.args and context.args[0].startswith("@") and context.args[0].lower() == BOT_USERNAME:
+        args = context.args[1:]
+    else:
+        args = context.args
 
-    escrow_id = str(uuid.uuid4())[:8]
+    amount, note = parse_amount_and_note(args)
+    if amount is None:
+        await msg.reply_text("Usage: /Add <amount> [short note]")
+        return
 
-    ESCROWS[escrow_id] = {
-        "id": escrow_id,
-        "creator_id": update.effective_user.id,
-        "buyer_username": buyer_username,
-        "seller_username": seller_username,
+    deal_id = str(uuid.uuid4())[:8]
+
+    deal = {
+        "id": deal_id,
+        "chat_id": chat.id,
+        "message_id": msg.message_id,
+        "creator_id": msg.from_user.id,
         "amount": amount,
-        "terms": terms,
-        "status": "PENDING_PAYMENT",
-        "proof": None,
-        "approved_by": None,
-        "approved_at": None,
-        "cancelled_by": None,
-        "cancel_reason": None,
+        "note": note,
+        "status": "OPEN",
         "created_at": datetime.utcnow().isoformat(),
+        "closed_at": None,
+        "closed_by": None,
     }
 
-    text = (
-        f"Escrow ban gaya.\n\n"
-        f"ID: {escrow_id}\n"
-        f"Buyer: {buyer_username}\n"
-        f"Seller: {seller_username}\n"
+    DEALS[deal_id] = deal
+    MSG_TO_DEAL[(chat.id, msg.message_id)] = deal_id
+
+    tagged_users = []
+    if msg.entities:
+        for ent in msg.entities:
+            if ent.type == "mention":
+                tagged_users.append(
+                    msg.text[ent.offset : ent.offset + ent.length]
+                )
+
+    tags_str = " ".join(tagged_users) if tagged_users else ""
+
+    reply_text = (
+        f"📌 Escrow deal created.\n\n"
+        f"ID: `{deal_id}`\n"
         f"Amount: {amount}\n"
-        f"Status: PENDING_PAYMENT\n"
-        f"Terms: {terms}\n\n"
-        "Buyer payment ke baad yeh message bheje:\n"
-        f"proof {escrow_id} <txid ya note>"
-    )
-    await update.message.reply_text(text)
-
-
-async def my_escrows(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    uname = f"@{user.username}" if user.username else None
-
-    lines = []
-    for e in ESCROWS.values():
-        if (
-            e["creator_id"] == user.id
-            or (uname and (e["buyer_username"] == uname or e["seller_username"] == uname))
-        ):
-            lines.append(
-                f"{e['id']}: {e['buyer_username']} -> {e['seller_username']} "
-                f"{e['amount']} [{e['status']}]"
-            )
-
-    if not lines:
-        await update.message.reply_text("Tumhare naam ka koi escrow nahi mila.")
-    else:
-        await update.message.reply_text("\n".join(lines))
-
-
-async def handle_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    parts = text.split(maxsplit=2)
-    if len(parts) < 3 or parts[0].lower() != "proof":
-        return
-
-    _, escrow_id, proof_text = parts
-    e = ESCROWS.get(escrow_id)
-    if not e:
-        await update.message.reply_text("Galat escrow ID.")
-        return
-
-    e["proof"] = proof_text
-    e["status"] = "AWAITING_ADMIN_APPROVAL"
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Release (Approve)", callback_data=f"approve:{escrow_id}"
-                ),
-                InlineKeyboardButton(
-                    "❌ Cancel & Refund", callback_data=f"cancel:{escrow_id}"
-                ),
-            ]
-        ]
+        f"Note: {note or '-'}\n"
+        f"Status: OPEN\n"
     )
 
-    text = (
-        f"Proof mil gaya escrow {escrow_id} ke liye.\n\n"
-        f"Buyer: {e['buyer_username']}\n"
-        f"Seller: {e['seller_username']}\n"
-        f"Amount: {e['amount']}\n"
-        f"Proof: {proof_text}\n\n"
-        "Admin approval ka wait ho raha hai."
-    )
+    if tags_str:
+        reply_text += f"\nParties: {tags_str}\n"
 
-    await update.message.reply_text(text, reply_markup=keyboard)
+    reply_text += "\nDeal complete hone par is message ko reply karke /Close bhejo."
+
+    await msg.reply_text(reply_text, parse_mode="Markdown")
 
 
-async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    chat = msg.chat
 
-    user_id = query.from_user.id
-    if not is_admin(user_id):
-        await query.edit_message_text("Tum admin nahi ho, approve/cancel nahi kar sakte.")
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text("Ye command sirf group / supergroup me use karo.")
         return
 
-    data = query.data
-    action, escrow_id = data.split(":", 1)
+    deal_id = None
 
-    e = ESCROWS.get(escrow_id)
-    if not e:
-        await query.edit_message_text("Escrow nahi mila.")
-        return
+    # Prefer reply: /Close as reply to /Add message
+    if msg.reply_to_message:
+        key = (chat.id, msg.reply_to_message.message_id)
+        deal_id = MSG_TO_DEAL.get(key)
 
-    if e["status"] in ("RELEASED", "CANCELLED"):
-        await query.edit_message_text(
-            f"Escrow {escrow_id} already {e['status']} hai."
+    # Fallback: /Close <deal_id>
+    if not deal_id and context.args:
+        deal_id = context.args[0]
+
+    if not deal_id:
+        await msg.reply_text(
+            "Usage:\n"
+            "- Reply to original /Add message with /Close\n"
+            "  ya\n"
+            "- /Close <deal_id>"
         )
         return
 
-    if action == "approve":
-        e["status"] = "RELEASED"
-        e["approved_by"] = user_id
-        e["approved_at"] = datetime.utcnow().isoformat()
-        text = (
-            f"✅ Escrow {escrow_id} RELEASED.\n\n"
-            f"Amount: {e['amount']}\n"
-            f"Buyer: {e['buyer_username']}\n"
-            f"Seller: {e['seller_username']}\n\n"
-            "Admin ne release approve kar diya.\n"
-            "Funds seller ko off‑bot de do agar abhi nahi diye."
-        )
-    else:
-        e["status"] = "CANCELLED"
-        e["cancelled_by"] = user_id
-        e["cancel_reason"] = "Admin cancelled via button"
-        text = (
-            f"❌ Escrow {escrow_id} CANCELLED.\n\n"
-            f"Buyer: {e['buyer_username']}\n"
-            f"Seller: {e['seller_username']}\n\n"
-            "Admin ne deal cancel kar di.\n"
-            "Buyer ko off‑bot refund karna hai."
-        )
+    deal = DEALS.get(deal_id)
+    if not deal or deal["chat_id"] != chat.id:
+        await msg.reply_text("Koi active deal nahi mila is ID ke saath.")
+        return
 
-    await query.edit_message_text(text)
+    if deal["status"] == "CLOSED":
+        await msg.reply_text("Ye deal pehle hi CLOSED hai.")
+        return
+
+    deal["status"] = "CLOSED"
+    deal["closed_at"] = datetime.utcnow().isoformat()
+    deal["closed_by"] = msg.from_user.id
+
+    await msg.reply_text(
+        f"✅ Deal CLOSED.\n\n"
+        f"ID: `{deal_id}`\n"
+        f"Amount: {deal['amount']}\n"
+        f"Note: {deal['note'] or '-'}\n"
+        f"Closed by: {msg.from_user.mention_html()}",
+        parse_mode="HTML",
+    )
 
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN env var missing")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("new_escrow", new_escrow))
-    app.add_handler(CommandHandler("my_escrows", my_escrows))
-    app.add_handler(CallbackQueryHandler(approval_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_proof))
+    app.add_handler(CommandHandler(["Add", "add"], cmd_add))
+    app.add_handler(CommandHandler(["Close", "close"], cmd_close))
+
+    # optional: ignore all other text
+    app.add_handler(MessageHandler(filters.COMMAND, lambda *_: None))
 
     app.run_polling()
 
